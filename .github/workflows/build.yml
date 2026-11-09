@@ -1,0 +1,50 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(tr -d '\r\n' < version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare UTF-8 requirements file
+        shell: pwsh
+        run: Get-Content requirements.txt -Encoding Unicode | Set-Content requirements-ci.txt -Encoding UTF8
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: >
+          pyinstaller --onefile --windowed --name mail_marketing_cleanup
+          --collect-data customtkinter
+          --collect-all tzdata
+          --hidden-import=PIL._tkinter_finder
+          mail_marketing_ui.py
+
+      - name: Create/update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          files: dist/mail_marketing_cleanup.exe

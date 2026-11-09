@@ -1,0 +1,12 @@
+__pycache__/
+.vscode/
+*.xlsx
+*.json
+config/
+*.log
+*.csv
+venv/
+!endpoints.example.json
+INCOMPLETE.txt
+*.exe
+.claude/
