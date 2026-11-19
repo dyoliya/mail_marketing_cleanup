@@ -49,7 +49,7 @@ POPULATIONS = {
     'NCOP': {'category': False, 'validate': 'validate_ncop_db', 'execute': 'execute_ncop'},
     'Pooling Order': {'category': False, 'validate': 'validate_po_db', 'execute': 'execute_po'},
     'NTM or Non-Targeted Marketing': {'category': False, 'validate': 'validate_ntm_db', 'execute': 'execute_ntm'},
-    'Deceased Owners (DEO)': {'category': False, 'validate': None, 'execute': None},
+    'Deceased Owners (DEO)': {'category': False, 'validate': 'validate_deo_db', 'execute': 'execute_deo'},
     'Conversion Campaign: Prio 2': {'category': False, 'validate': 'validate_campaign_db', 'execute': 'execute_campaign'},
     'Conversion Campaign: Prio 3': {'category': False, 'validate': 'validate_campaign_db', 'execute': 'execute_campaign'},
     'Conversion Campaign: Prio 4': {'category': False, 'validate': 'validate_campaign_db', 'execute': 'execute_campaign'},
@@ -684,7 +684,7 @@ def wide_match_details(complete_result, subset):
 class MatchEvidence:
     def __init__(self, population, original, references, c3):
         self.population = population
-        self.id_column = {'Bottoms Up': 'id', 'NCOP': 'ncop_id', 'Pooling Order': 'po_id', 'NTM or Non-Targeted Marketing': 'id',}[population]
+        self.id_column = {'Bottoms Up': 'id', 'NCOP': 'ncop_id', 'Pooling Order': 'po_id', 'NTM or Non-Targeted Marketing': 'id', 'Deceased Owners (DEO)': 'deo_id',}[population]
         self.original = original.copy()
         self.original_columns = list(original.columns)
         self.references = {
@@ -827,7 +827,7 @@ class MatchEvidence:
         if source == 'C3':
             self.c3_equal(index, 'ADDRESS', field, value, key)
         else:
-            mode = 'po_address' if self.population == 'Pooling Order' else 'address'
+            mode = 'po_address' if self.population in ('Pooling Order', 'Deceased Owners (DEO)') else 'address'
             self.equal(index, 'ADDRESS', field, value, {key}, source,
                        ['Person - Mailing Address'], mode)
 
@@ -858,19 +858,32 @@ class MatchEvidence:
     def has_value(self, kind, row):
         is_bu = self.population == 'Bottoms Up'
         is_po = self.population == 'Pooling Order'
+        is_deo = self.population == 'Deceased Owners (DEO)'
         if kind == 'DEAL_TITLE':
             if is_bu:
                 return bool(normalize_deal_title_for_match(format_deal_title(row)))
+            if is_deo:
+                return bool(deo_titles(row))
             return bool(po_titles(row) if is_po else ncop_titles(row))
         if kind == 'ADDRESS':
-            columns = (('Input: Address', 'Input: City', 'Input: State',
-                        'md_address', 'md_city', 'md_state') if is_bu else
-                       tuple(c for fields in (PO_ADDRESS_SETS if is_po else NCOP_ADDRESS_SETS).values()
-                             for c in fields))
+            if is_bu:
+                columns = ('Input: Address', 'Input: City', 'Input: State', 'md_address', 'md_city', 'md_state')
+            elif is_deo:
+                columns = tuple(c for fields in DEO_ADDRESS_SETS.values() for c in fields)
+            else:
+                columns = tuple(c for fields in (PO_ADDRESS_SETS if is_po else NCOP_ADDRESS_SETS).values()
+                                 for c in fields)
             return any(match_text(row.get(c)) for c in columns)
         if kind == 'PHONE':
-            columns = [f'phone{i}' for i in range(1, 6)] if is_bu else (PO_PHONE_COLS if is_po else NCOP_PHONE_COLS)
+            if is_bu:
+                columns = [f'phone{i}' for i in range(1, 6)]
+            elif is_deo:
+                columns = DEO_PHONE_COLS
+            else:
+                columns = PO_PHONE_COLS if is_po else NCOP_PHONE_COLS
             return any(ncop_phone_tokens(row.get(c)) for c in columns)
+        if is_deo and kind == 'SERIAL_NUMBER':
+            return bool(match_text(row.get('serial_number'))) or bool(match_text(row.get('deo_serial_number')))
         field = {'SERIAL_NUMBER': 'Serial Number' if is_bu else 'serial_number',
                  'SOURCE_ID': self.id_column, 'CONTACT_GROUP_ID': 'contact_group_id'}[kind]
         return bool(match_text(row.get(field)))
@@ -918,6 +931,9 @@ class MatchEvidence:
             if row['clean_tag'] == 'N' and not evidence:
                 raise ValueError(f'Missing exclusion evidence for {self.population} {rid}.')
             assigned = self.population != 'Bottoms Up' and bool(ncop_text(row.get('deal_id')))
+            if self.population == 'Deceased Owners (DEO)' and not assigned:
+                # A BU Database ID match also short-circuits matching, same as deal_id.
+                assigned = any(e['match_type'] == 'BU_DATABASE_ID' for e in own)
             result.at[index, 'matching_status'] = 'SKIPPED_EXISTING_DEAL_ID' if assigned else 'CHECKED'
             result.at[index, 'existing_deal_id'] = report_id(row.get('deal_id')) if self.population != 'Bottoms Up' else 'N/A'
             for column, kind in (
@@ -930,7 +946,7 @@ class MatchEvidence:
                     'NOT_CHECKED' if assigned else
                     'NO_MATCH' if self.has_value(kind, row) else 'NO_VALUE'
                 )
-                if kind == 'CONTACT_GROUP_ID' and self.population != 'Bottoms Up':
+                if kind == 'CONTACT_GROUP_ID' and self.population not in ('Bottoms Up', 'Deceased Owners (DEO)'):
                     value = 'N/A'
                 result.at[index, column] = value
             result.at[index, 'excluded_via_contact_group'] = ('Y' if inherited else 'N') if self.population == 'Bottoms Up' else 'N/A'
@@ -2820,6 +2836,279 @@ def execute_po(config, ready, result_folder):
         ready['deals'].to_csv(result_folder / 'pipedrive_deals_366502.csv', index=False)
         ready['persons'].to_csv(result_folder / 'pipedrive_persons_891899.csv', index=False)
     print(f'COMPLETE: {len(result):,} PO rows | Y: {summary["clean_Y"]:,} | N: {summary["excluded_N"]:,} (no mailing address: {summary["no_mailing_address_N"]:,})')
+    return summary
+
+
+# DEO carries its own already-matched deal_id/budb_id, a corrected_contact_type
+# eligibility filter distinct from contact_type, and its own recorded_address as
+# the actual address used for mailing. No category, scope, grouping, or dedup.
+DEO_ADDRESS_SETS = {
+    'input_address_set': ('input_address', 'input_city', 'input_state'),
+    'md_address_set': ('md_address', 'md_city', 'md_state'),
+    'recorded_address_set': ('recorded_address',),
+}
+DEO_PHONE_COLS = [f'phone{i}' for i in range(1, 6)]
+DEO_DISPLAY_COLS = [
+    'deo_id', 'deo_serial_number', 'owner', 'sum_of_all_offers', 'budb_id', 'contact_group_id',
+    'corrected_contact_type', 'executor_heir_trustee_name', 'relationship_to_mo',
+    'ownerhsip_portion', 'recorded_address', 'combined_counties_from_all_sources',
+]
+DEO_COLS = (
+    DEO_DISPLAY_COLS
+    + ['first_name', 'last_name', 'all_counties', 'contact_group_id',
+       'serial_number', 'budb_id', 'deal_id']
+    + [c for cols in DEO_ADDRESS_SETS.values() for c in cols if c != 'recorded_address']
+    + DEO_PHONE_COLS
+)
+# NULL/blank corrected_contact_type is eligible; only these explicit values are excluded.
+DEO_WHERE = (
+    "UPPER(TRIM(COALESCE(corrected_contact_type, ''))) NOT IN "
+    "('COMPANY', 'RELIGIOUS INSTITUTION', 'DUPLICATE', 'ESTATE - HEIRS NOT FOUND')"
+)
+
+
+def deo_budb_id_tokens(value):
+    return {n for p in split_pipe_values(value) if (n := extract_int_token(p)) is not None}
+
+
+def deo_titles(row):
+    names = {ncop_text(row['owner'])}
+
+    first = ncop_text(row.get('first_name'))
+    last = ncop_text(row.get('last_name'))
+    if first and last:
+        names.add(f'{first} {last}')
+
+    locations = set()
+
+    for entry in ncop_text(row['combined_counties_from_all_sources']).split('|'):
+        entry = re.sub(r'\s+', ' ', entry).strip()
+        if not entry:
+            continue
+
+        # Each entry contains one county and its corresponding state.
+        county, separator, state = entry.rpartition(',')
+        county = county.strip().upper()
+        state = state.strip().upper()
+
+        # Avoid adding "County" twice.
+        county = re.sub(r'\s+COUNTY$', '', county).strip()
+
+        if (
+            not separator
+            or not county
+            or not re.fullmatch(r'[A-Z]{2}', state)
+        ):
+            raise ValueError(
+                f"DEO {row.get('deo_id', '')}: invalid all_counties "
+                f"entry {entry!r}. Expected 'County, ST' separated by pipes."
+            )
+
+        locations.add((county, state))
+
+    return sorted({
+        f'{name} {county} County, {state}'
+        for name in names
+        if name
+        for county, state in locations
+    })
+
+
+def validate_deo_db(path, _selected_filter=None):
+    with contextlib.closing(open_db(path)) as con:
+        columns = [row[1] for row in con.execute('PRAGMA table_info(deo)')]
+        require_columns(columns, DEO_COLS, 'deo table')
+        count = con.execute(
+            f'SELECT COUNT(*) FROM deo WHERE {DEO_WHERE}'
+        ).fetchone()[0]
+    if not count:
+        raise ValueError('No eligible DEO records found.')
+    print(f'DEO ready: {count:,} rows. Source is read-only.')
+    return count
+
+
+def cleanup_deo(df, ready):
+    result = df.copy().reset_index(drop=True)
+    audit = MatchEvidence('Deceased Owners (DEO)', result, {
+        'PIPEDRIVE': ready['deals'].copy(), 'ARCHIVE': ready['archived'].copy(),
+    }, ready['c3'])
+    reasons = {index: [] for index in result.index}
+
+    assigned_ids = result['deal_id'].map(ncop_text)
+    assigned = assigned_ids.ne('')
+    for index in result.index[assigned]:
+        reasons[index].append('Existing Deal ID in DEO: ' + assigned_ids.at[index])
+        audit.existing(index)
+
+    lookups = {}
+    for label, reference in (
+        ('Pipedrive', ready['deals']),
+        ('Archived Pipedrive', ready['archived']),
+    ):
+        lookups[label] = {
+            'addresses': set(reference['Person - Mailing Address'].map(normalize_po_address)) - {''},
+            'phones': get_phone_set(reference),
+            'serials': get_serial_set(reference),
+            'cids': get_cid_set(reference),
+            'bu_ids': get_bu_id_set(reference),
+        }
+
+    # Existing BUDB match: any of a row's pipe-separated budb_id values found in
+    # Pipedrive's "Deal - BU Database ID" field (current or archived) excludes it,
+    # same short-circuit idea as deal_id but checked against the live reference.
+    budb_ids = result['budb_id'].map(deo_budb_id_tokens)
+    budb_assigned = pd.Series(False, index=result.index)
+    for index in result.index[~assigned]:
+        row_bu_ids = budb_ids.at[index]
+        if not row_bu_ids:
+            continue
+        for label, lookup in lookups.items():
+            matched = row_bu_ids & lookup['bu_ids']
+            if matched:
+                source = 'PIPEDRIVE' if label == 'Pipedrive' else 'ARCHIVE'
+                reasons[index].append(f'BU Database ID match found in {label}')
+                audit.equal(index, 'BU_DATABASE_ID', 'budb_id', result.at[index, 'budb_id'],
+                            matched, source, ['Deal - BU Database ID'], 'integer')
+                budb_assigned.at[index] = True
+
+    pending = result.loc[~assigned & ~budb_assigned]
+    print(f'DEO: {assigned.sum():,} existing Deal IDs; {budb_assigned.sum():,} existing BUDB '
+          f'matches; {len(pending):,} rows need matching.')
+
+    for column in DEO_ADDRESS_SETS:
+        result[column] = ''
+    result['count_of_distinct_address'] = pd.Series(pd.NA, index=result.index, dtype='Int64')
+    result['deal_title_match'] = ''
+
+    if not pending.empty:
+        c3_addresses, raw_c3_phones = ready['c3']
+        c3_phones = {number for value in raw_c3_phones for number in ncop_phone_tokens(value)}
+        titles = pending.apply(deo_titles, axis=1).explode().dropna()
+        current_mask, archived_mask = build_deal_title_masks(
+            titles, ready['deals']['Deal - Title'], ready['archived']['Deal - Title']
+        )
+        audit.titles(titles, (('PIPEDRIVE', current_mask), ('ARCHIVE', archived_mask)))
+        for label, mask in (('Pipedrive', current_mask), ('Archived Pipedrive', archived_mask)):
+            for index in mask[mask].index.unique():
+                reason = f'Found matching Deal Title from {label}'
+                reasons[index].append(reason)
+                previous = result.at[index, 'deal_title_match']
+                result.at[index, 'deal_title_match'] = '; '.join(filter(None, (previous, reason)))
+        for number, (index, row) in enumerate(pending.iterrows(), 1):
+            distinct = set()
+            for output_column, columns in DEO_ADDRESS_SETS.items():
+                parts = [ncop_text(row[column]) for column in columns]
+                address = normalize_po_address(', '.join(part for part in parts if part))
+                matches = []
+                if address:
+                    distinct.add(address)
+                    for label, lookup in lookups.items():
+                        if address in lookup['addresses']:
+                            matches.append(f'Address found in {label}')
+                            audit.address(index, columns, address,
+                                          'PIPEDRIVE' if label == 'Pipedrive' else 'ARCHIVE')
+                    if address in c3_addresses:
+                        matches.append('Address found in C3')
+                        audit.address(index, columns, address, 'C3')
+                result.at[index, output_column] = '; '.join(matches)
+                reasons[index].extend(f'{output_column}: {match}' for match in matches)
+            result.at[index, 'count_of_distinct_address'] = len(distinct)
+            phones = {phone for column in DEO_PHONE_COLS for phone in ncop_phone_tokens(row[column])}
+            serials = (set(split_pipe_values(row['serial_number']))
+                       | set(split_pipe_values(row['deo_serial_number'])))
+            cgid = extract_int_token(ncop_text(row['contact_group_id']))
+            for label, lookup in lookups.items():
+                source = 'PIPEDRIVE' if label == 'Pipedrive' else 'ARCHIVE'
+                audit.contact_values(index, row, DEO_PHONE_COLS, source, bool(phones & lookup['phones']))
+                if phones & lookup['phones']:
+                    reasons[index].append(f'Phone Number is in {label}')
+                matched_serials = serials & lookup['serials']
+                if matched_serials:
+                    reasons[index].append(f'Serial Number is in {label}')
+                    audit.equal(index, 'SERIAL_NUMBER', 'serial_number', row['serial_number'],
+                                matched_serials, source, ['Deal - Serial Number'], 'serial')
+                if cgid is not None and cgid in lookup['cids']:
+                    reasons[index].append(f'Contact Group ID is in {label}')
+                    audit.equal(index, 'CONTACT_GROUP_ID', 'contact_group_id', row['contact_group_id'],
+                                {cgid}, source, ['Deal - Contact Group ID'], 'integer')
+            if phones & c3_phones:
+                reasons[index].append('Phone Number is in C3')
+                audit.contact_values(index, row, DEO_PHONE_COLS, 'C3', True)
+            if number % 1000 == 0 or number == len(pending):
+                print(f'DEO matching: {number:,} / {len(pending):,} rows...')
+
+    # recorded_address is the actual address used for mailing: a row cannot be
+    # clean without one, regardless of whether input_address/md_address are usable.
+    recorded_present = result['recorded_address'].map(address_part).ne('')
+    for index in result.index:
+        if not reasons[index] and not recorded_present.at[index]:
+            reasons[index].append(NO_ADDRESS_REASON)
+            audit.add(index, 'NO_MAILING_ADDRESS', 'recorded_address', '', 'SOURCE_DATABASE', '', '')
+
+    # Independent of every other check: unknown ownership portion also forces N.
+    portion = result['ownerhsip_portion'].map(ncop_text).str.upper()
+    missing_portion = portion.eq('') | portion.eq('UNKNOWN')
+    for index in result.index[missing_portion]:
+        reasons[index].append('Ownership portion not available')
+        audit.add(index, 'OWNERSHIP_PORTION_MISSING', 'ownerhsip_portion',
+                  result.at[index, 'ownerhsip_portion'], 'SOURCE_DATABASE', '', '')
+
+    result['clean_tag'] = ['N' if reasons[index] else 'Y' for index in result.index]
+    result['reason_for_removal'] = [
+        '; '.join(reasons[index]) if reasons[index] else 'No cleanup matches found - FOR MANUAL REVIEW'
+        for index in result.index
+    ]
+    return audit.finish(result)
+
+
+def execute_deo(config, ready, result_folder):
+    with contextlib.closing(open_db(config['db'])) as con:
+        chunks, loaded = [], 0
+        for chunk in pd.read_sql_query(
+            f'SELECT * FROM deo WHERE {DEO_WHERE} ORDER BY deo_id',
+            con, chunksize=25000,
+        ):
+            chunks.append(chunk)
+            loaded += len(chunk)
+            print(f'Reading DEO: {loaded:,} / {ready["count"]:,} rows...')
+    if not chunks:
+        raise ValueError('No DEO rows remain. Check references again.')
+    if ready['fingerprints'] != fingerprints(config):
+        raise ValueError('The database changed while reading. Check references again.')
+    result = cleanup_deo(pd.concat(chunks, ignore_index=True), ready)
+    date = datetime.now(ZoneInfo('America/Chicago')).strftime('%Y%m%d')
+    # Cleanup tab shows only DEO's own identity/offer/ownership/address columns plus
+    # the standard findings columns every population's output has (audit.finish()
+    # already strips population-specific intermediate columns, e.g. deal_title_match,
+    # down to MATCH_SUMMARY_COLUMNS + clean_tag + reason_for_removal).
+    cleanup_columns = DEO_DISPLAY_COLS + ['clean_tag', 'reason_for_removal'] + MATCH_SUMMARY_COLUMNS
+    display = result[cleanup_columns].rename(columns={'ownerhsip_portion': 'ownership_portion'})
+    outputs = []
+    for part, start in enumerate(range(0, len(result), 1048575), 1):
+        suffix = f' - part {part}' if len(result) > 1048575 else ''
+        target = result_folder / f'{date} - DEO - With Cleanup Tagging{suffix}.xlsx'
+        with pd.ExcelWriter(target, engine='xlsxwriter', engine_kwargs={
+            'options': {'strings_to_formulas': False, 'strings_to_urls': False, 'constant_memory': True, 'use_zip64': True}
+        }) as writer:
+            write_cleanup_tabs(writer, result, display.iloc[start:start+1048575])
+        outputs.append(target.name)
+        print(f'Saved {target.name}')
+    summary = {
+        'population': 'Deceased Owners (DEO)', 'input_rows': loaded, 'output_rows': len(result),
+        'clean_Y': int(result['clean_tag'].eq('Y').sum()),
+        'excluded_N': int(result['clean_tag'].eq('N').sum()),
+        'no_mailing_address_N': count_no_address(result),
+        'group_duplicates_removed': 0, 'files': outputs,
+        'reference_checked_at': ready['prepared_at'],
+        'completed_at': datetime.now().isoformat(timespec='seconds'),
+        'source_files': ready['fingerprints'], 'pipedrive_mode': config['mode'],
+        'deal_filter': 366502, 'person_filter': 891899,
+    }
+    (result_folder / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    if config['mode'] == 'Download via API':
+        ready['deals'].to_csv(result_folder / 'pipedrive_deals_366502.csv', index=False)
+        ready['persons'].to_csv(result_folder / 'pipedrive_persons_891899.csv', index=False)
+    print(f'COMPLETE: {len(result):,} DEO rows | Y: {summary["clean_Y"]:,} | N: {summary["excluded_N"]:,} (no mailing address: {summary["no_mailing_address_N"]:,})')
     return summary
 
 

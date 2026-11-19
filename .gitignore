@@ -10,3 +10,4 @@ venv/
 INCOMPLETE.txt
 *.exe
 .claude/
+instructions.txt

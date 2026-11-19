@@ -2,7 +2,7 @@
 
 **Mail Marketing Cleanup Tool** is a desktop utility (built with Python) that implements a **controlled population-cleaning workflow** for mail marketing campaigns.
 
-It takes a mailing population (Bottoms Up, NCOP, Pooling Order, NTM, or a Pipedrive-driven Conversion Campaign list), cross-checks every record against the company's current and archived Pipedrive deals/contacts and the "C3" opt-out/suppression register (address, phone, email), and tags each record clean or excluded — with a full, explainable audit trail — before it is sent to a mail house.
+It takes a mailing population (Bottoms Up, NCOP, Pooling Order, NTM, Deceased Owners (DEO), or a Pipedrive-driven Conversion Campaign list), cross-checks every record against the company's current and archived Pipedrive deals/contacts and the "C3" opt-out/suppression register (address, phone, email), and tags each record clean or excluded — with a full, explainable audit trail — before it is sent to a mail house.
 
 ---
 
@@ -14,7 +14,7 @@ It takes a mailing population (Bottoms Up, NCOP, Pooling Order, NTM, or a Pipedr
 
 ## 🚧 Problem Statement / Motivation
 
-Every mail marketing drop starts from a population list — Bottoms Up owners, NCOP owners/heirs, a Pooling Order list, NTM, or a Pipedrive-driven campaign filter — that has to be checked against several other sources before a single letter goes out: is the Mineral Owner already in an active Pipedrive deal, were they in a past (archived) deal, and have they opted out of direct mail, phone, or email contact through the "C3" suppression lists?
+Every mail marketing drop starts from a population list — Bottoms Up owners, NCOP owners/heirs, a Pooling Order list, NTM, Deceased Owners (DEO), or a Pipedrive-driven campaign filter — that has to be checked against several other sources before a single letter goes out: is the Mineral Owner already in an active Pipedrive deal, were they in a past (archived) deal, and have they opted out of direct mail, phone, or email contact through the "C3" suppression lists?
 
 Doing that cross-referencing by hand, record by record, against live Pipedrive data, a SharePoint archive export, and three separate opt-out files is slow and error-prone at volume, and a missed match means mailing someone who should have been excluded — with no record of why a record was kept or dropped.
 
@@ -30,7 +30,7 @@ Mail Marketing Cleanup Tool addresses this by enforcing a controlled cleanup pip
 ---
 
 ## ✨ Features
-- **Multiple population types**, each with its own validation/execution handler: **Bottoms Up** (by category), **NCOP** (by Original Owners/Heirs/Both scope), **Pooling Order**, **NTM** (by output counties/states), and several Pipedrive-filter-driven **Conversion Campaign** and **Recycled** lists. (**Deceased Owners (DEO)** is registered but not yet implemented.)
+- **Multiple population types**, each with its own validation/execution handler: **Bottoms Up** (by category), **NCOP** (by Original Owners/Heirs/Both scope), **Pooling Order**, **NTM** (by output counties/states), **Deceased Owners (DEO)**, and several Pipedrive-filter-driven **Conversion Campaign** and **Recycled** lists.
 - **Live Pipedrive API sync**: Pipedrive deals and contacts are downloaded directly via the API (cursor-paginated, retried on throttling/server errors) and cached per token/filter for 8 hours to avoid redundant calls. (Manual CSV/XLSX upload for Pipedrive data exists in the code but is currently disabled.)
 - **Multi-source matching**: checks each record's normalized phone number, normalized mailing address, deal title (substring matching), and population-specific IDs (Bottoms-Up/NCOP/Pooling Order/Unique Database ID, Serial Number, Contact Group ID) against current Pipedrive deals/contacts, an archived-deals export, and the C3 opt-out register.
 - **Address normalization**: USPS-style abbreviation normalization (e.g. ROAD → RD, STREET → ST, NORTH → N), ZIP trimming, and alphanumeric-only canonicalization for reliable address matching.
@@ -46,7 +46,7 @@ Mail Marketing Cleanup Tool addresses this by enforcing a controlled cleanup pip
 
 ## 🧠 Logic Flow
 
-1. User selects a **population**: Bottoms Up, NCOP, Pooling Order, NTM, or a Conversion Campaign/Sales Recycled list, along with its category/scope/filter and source (local SQLite database, Pipedrive filter download, or manual file).
+1. User selects a **population**: Bottoms Up, NCOP, Pooling Order, NTM, Deceased Owners (DEO), or a Conversion Campaign/Sales Recycled list, along with its category/scope/filter and source (local SQLite database, Pipedrive filter download, or manual file).
 2. App loads **reference data**:
    - Current open Pipedrive deals and persons, via live API download.
    - The archived-deals export (SharePoint), joined to persons.
@@ -85,6 +85,15 @@ Finally, a record still tagged `Y` is tagged `N` ("No valid mailing address") if
 
 **NTM** — a record is excluded if its deal title, mailing address, phone number, Serial Number, or Unique Database ID matches current or archived Pipedrive (address and phone also checked against C3). In addition, **all records sharing the same Contact ID are excluded together**: if one record in the group matches, every record in that group is tagged `N`, and only one record per group is kept in the selected county/state output — a row with a valid mailing address is preferred, then the lowest numeric `id`. If the kept record is still tagged `Y` but neither its owner-reported (`input_*`) nor mail-deliverable (`md_*`) address has a street, city, and state all filled in, it is tagged `N` ("No valid mailing address"). Email is **not** checked. Same **Company/Religious Institution pre-filter** as NCOP applies, on `contact_type`. Group matching and exclusion are computed across **all** of a contact's eligible counties/states, not just the ones selected for the current run — so a record can be excluded because of a match tied to a county/state you didn't select for this mailing.
 
+**Deceased Owners (DEO)** — a record is excluded if:
+- It already has a Pipedrive Deal ID on file ("Existing Deal ID in DEO") — checked before anything else.
+- Otherwise, its BU Database ID (`budb_id`) matches a current or archived Pipedrive deal's BU Database ID ("BU Database ID match") — also checked before the rules below, and skips them the same way an existing Deal ID does.
+- Otherwise, its deal title (owner name, and First Name + Last Name as a second candidate when both are present, built for every county/state listed in `combined_counties_from_all_sources`), mailing address, phone number, Serial Number (`serial_number` and `deo_serial_number` combined), or Contact Group ID matches current or archived Pipedrive — address and phone are also checked against **C3**. Three address sets are each checked independently: the owner-reported (`input_address`/`input_city`/`input_state`), skip-traced (`md_address`/`md_city`/`md_state`), and `recorded_address` (the actual address used for mailing).
+- Email is **not** checked for DEO.
+- **Eligibility pre-filter**: records whose `corrected_contact_type` is `COMPANY`, `RELIGIOUS INSTITUTION`, `DUPLICATE`, or `ESTATE - HEIRS NOT FOUND` (case/whitespace-insensitive, exact match) are dropped from the population at selection time, before any matching runs. A blank/NULL `corrected_contact_type` is eligible. There is no Contact Group dedup/exclusion step for DEO — every record is judged, kept, and reported on its own, even when it shares a `contact_group_id` with another record.
+- A record with no other match is tagged `N` ("No valid mailing address") if `recorded_address` is blank or a placeholder (`N/A`, `UNKNOWN`) — this checks `recorded_address` alone, not the input/skip-traced address fields.
+- Independently of every rule above — including a record that already matched something — a record is also tagged `N` ("Ownership portion not available") if `ownerhsip_portion` is blank or `UNKNOWN`. (The output renames this column to `ownership_portion`.)
+
 **Conversion Campaign / Sales Recycled lists** (Prio 2/3/4, JR/Mid/SR AA Sales Recycled) — these populations ARE Pipedrive deals, so each record is checked against every *other* Pipedrive deal (its own deal is excluded from the comparison) plus the archive:
 - Mailing address, phone number, **and email** (the only population type where email is checked) match another deal's contact info, or appear in **C3** (address, phone, and email are all checked against C3 for this population).
 - BU Database ID, NCOP ID, Unique Database ID, Pooling Order ID, Contact Group ID, or Serial Number matches another deal's corresponding ID.
@@ -101,6 +110,7 @@ The generated deal title referenced above isn't built from the same name field t
 | NCOP | `owner_name`, **and** `First Name` + `Last Name` as a second candidate when both are present — a match on either counts. |
 | Pooling Order | `lessor_owner`, **and** `First Name` + `Last Name` as a second candidate when both are present (same logic as NCOP). |
 | NTM | `full_name`, **and** `First Name` + `Last Name` as a second candidate when both are present (same logic as NCOP). |
+| DEO | `owner`, **and** `First Name` + `Last Name` as a second candidate when both are present — a title is generated for every county/state listed in `combined_counties_from_all_sources`, and a match on any of them counts. |
 | Conversion Campaign / Sales Recycled | No deal-title matching is done for this population at all. |
 
 ### Required reference columns (regardless of population)
@@ -127,6 +137,7 @@ Each population also requires its own ID column in the archive, in addition to t
 | NCOP | `NCOP ID` |
 | Pooling Order | `Pooling Order ID` |
 | NTM | `Unique Database ID` |
+| DEO | `Contact Group ID`, `BU Database ID` |
 | Conversion Campaign / Sales Recycled | `Contact Group ID`, `BU Database ID`, `NCOP ID`, `Pooling Order ID`, `Unique Database ID` |
 
 > If any of these columns are missing, the run stops before any matching begins and reports which one — select the latest full archive export (or check your Pipedrive field setup) and try again.
@@ -146,6 +157,9 @@ Each population's own source (the local database table, or the uploaded export f
 
 **NTM** (`ntm` table):
 `id`, `contact_id`, `full_name`, `first_name`, `middle_name`, `last_name`, `contact_type`, `target_county`, `target_state`, `serial_number`, `old_serial_number`; raw address `input_address`/`input_city`/`input_state`/`input_postalcode` (optional); `md_address`/`md_city`/`md_state`/`md_postalcode` (optional); phones `phone1`–`phone6`
+
+**Deceased Owners (DEO)** (`deo` table):
+`deo_id`, `deo_serial_number`, `owner`, `sum_of_all_offers`, `budb_id`, `contact_group_id`, `corrected_contact_type`, `executor_heir_trustee_name`, `relationship_to_mo`, `ownerhsip_portion`, `combined_counties_from_all_sources`, `first_name`, `last_name`, `all_counties`, `serial_number`, `deal_id`; three address sets — `input_address`/`input_city`/`input_state`, `md_address`/`md_city`/`md_state`, and `recorded_address`; phones `phone1`–`phone5`
 
 **Conversion Campaign / Sales Recycled** (uploaded export, or the live Pipedrive download when using that source):
 `Deal - ID`, `Deal - Title`, `Deal - Pipeline`, `Deal - Stage`, `Deal - Owner`, `Deal - Value`, `Deal - Deal created`, `Deal - Deal Status`, `Deal - Deal Summary`, `Deal - Unique Database ID`, `Deal - BU Database ID`, `Deal - NCOP ID`, `Deal - Pooling Order ID`, `Deal - Contact Group ID`, `Deal - Serial Number`, `Deal - Contact person`, `Deal - County`, `Deal - County (Old)`, `Deal - Last RVM Date`, `Deal - Marketing Medium`, `Person - Mailing Address`, `Person - Phone - Home`, `Person - Phone - Mobile`, `Person - Phone - Other`, `Person - Phone - Work`, `Person - Email - Home`, `Person - Email - Other`, `Person - Email - Work`. Of these, only the ID columns, `Deal - Title`, the address, and the phone/email columns feed the matching rules above — the rest (pipeline, stage, owner, value, dates, etc.) are carried through for display only.
@@ -231,7 +245,7 @@ The app is a single scrollable window: five numbered input panels on the left, a
 **Panels 01–02 — Connect to Pipedrive, Your population**
 ![Connect to Pipedrive and Your population panels](screenshots/01-connect-and-population.png)
 - **01 Connect to Pipedrive**: where you paste your Pipedrive API token. This is the only reference source the app pulls live — everything else below is a file you point it to.
-- **02 Your population**: pick the population type (Bottoms Up, NCOP, Pooling Order, NTM, or a Conversion Campaign) and its category/scope/filter, then the source file or database for that population.
+- **02 Your population**: pick the population type (Bottoms Up, NCOP, Pooling Order, NTM, Deceased Owners (DEO), or a Conversion Campaign) and its category/scope/filter, then the source file or database for that population.
 - **References** (right): a live readiness checklist for all five inputs — turns from "Needed" to ready once each one is validated.
 - **Activity** (right): the full log of what the app is doing, updated as you work.
 
@@ -256,7 +270,7 @@ The app is a single scrollable window: five numbered input panels on the left, a
 ### B. Clean a population
 1. Launch the app (`python mail_marketing_ui.py`, or the compiled executable).
 2. **Connect to Pipedrive**: enter your API token.
-3. **Your population**: choose the population type (Bottoms Up, NCOP, Pooling Order, NTM, or a Conversion Campaign), its category/scope/filter, and its source (local database, Pipedrive filter, or manual file).
+3. **Your population**: choose the population type (Bottoms Up, NCOP, Pooling Order, NTM, Deceased Owners (DEO), or a Conversion Campaign), its category/scope/filter, and its source (local database, Pipedrive filter, or manual file).
 4. **C3 references**: click **Refresh latest C3 files** to sync from Google Drive, or point to a local folder.
 5. **Archived deals**: upload the SharePoint archive export file.
 6. **Save your results**: choose an output folder.
