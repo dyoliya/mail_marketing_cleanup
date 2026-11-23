@@ -6,7 +6,7 @@ It takes a mailing population (Bottoms Up, NCOP, Pooling Order, NTM, Deceased Ow
 
 ---
 
-![Version](https://img.shields.io/badge/version-1.1.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/version-1.2.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.11%2B-273946?style=for-the-badge&logo=python&logoColor=ffab4c)
 ![Status](https://img.shields.io/badge/status-active-273946?style=for-the-badge&logo=github&logoColor=ffab4c)
 
@@ -35,7 +35,7 @@ Mail Marketing Cleanup Tool addresses this by enforcing a controlled cleanup pip
 - **Multi-source matching**: checks each record's normalized phone number, normalized mailing address, deal title (substring matching), and population-specific IDs (Bottoms-Up/NCOP/Pooling Order/Unique Database ID, Serial Number, Contact Group ID) against current Pipedrive deals/contacts, an archived-deals export, and the C3 opt-out register.
 - **Address normalization**: USPS-style abbreviation normalization (e.g. ROAD → RD, STREET → ST, NORTH → N), ZIP trimming, and alphanumeric-only canonicalization for reliable address matching.
 - **ZIP/postal code formatting**: `Input: Zip Code`, `input_postalcode`, and `md_postalcode` are always written to the output as text — never as a float with a trailing `.0`.
-- **C3 suppression sync**: one-click refresh of the latest address/phone/email opt-out files from a shared Google Drive folder via a service account, with a local hash/stamp cache so unchanged files aren't re-downloaded.
+- **C3 suppression sync**: one-click refresh of the latest address/phone/email opt-out files (XLSX or CSV) from a shared Google Drive folder via a service account, with a local hash/stamp cache so unchanged files aren't re-downloaded.
 - **Group-aware de-duplication** by `contact_group_id`, with detection of conflicting matches within the same contact group.
 - **Full audit trail**: a secondary "Match Details" sheet lists exactly which reference record (Pipedrive deal, C3 row, etc.) triggered each exclusion, alongside a human-readable `reason_for_removal` on every row.
 - **Safe, resumable runs**: each run writes to its own timestamped output folder with an `INCOMPLETE.txt` marker that is only removed once the run finishes successfully.
@@ -79,6 +79,8 @@ Finally, a record still tagged `Y` is tagged `N` ("No valid mailing address") if
 - Email is **not** checked for NCOP.
 - **Company/Religious Institution pre-filter**: records whose `contact_type` is `COMPANY` or `RELIGIOUS INSTITUTION` (case/whitespace-insensitive, exact match) are dropped from the population at selection time, before any matching runs — they never appear in the output at all, excluded or otherwise.
 - A record with no other match is tagged `N` ("No valid mailing address") if none of its three address sets has a street, city, and state all filled in.
+- **Owner-type override**: a record counts as an **Original Owner** — regardless of its raw `is_original` value — if `relationship_to_mo` is `MINERAL OWNER` or `SELF`, or `lead_type` contains `OWNER`. This override applies both to the Original Owners/Heirs/Both scope filter at selection time and to which output file (Original Owners vs. Heirs) a record is written to.
+- **Duplicate retagging among clean rows**: after all other matching, any record still tagged `Y` that shares the same `owner_name`, `contact_name`, `address`, `city`, and `state` as another clean record is retagged `N` ("Duplicate among clean NCOP rows..."), keeping only the lowest `ncop_id` in each duplicate group as the survivor. No rows are dropped — the retagged duplicates stay in the output with `duplicate_of_ncop_id` pointing to the row that was kept.
 - When scope is **Both**, the run writes two separate output files — one for Original Owners, one for Heirs — each written even if it ends up with zero rows.
 
 **Pooling Order** — same rule set and order as NCOP (existing Deal ID first, then deal title / address / phone / Serial Number / Pooling Order ID against current + archived Pipedrive, address and phone also checked against C3). Email is **not** checked. Same **Company/Religious Institution pre-filter** as NCOP applies, on `contact_type`. A record with no other match is tagged `N` ("No valid mailing address") if neither of its two address sets has a street, city, and state all filled in.
@@ -92,7 +94,7 @@ Finally, a record still tagged `Y` is tagged `N` ("No valid mailing address") if
 - Email is **not** checked for DEO.
 - **Eligibility pre-filter**: records whose `corrected_contact_type` is `COMPANY`, `RELIGIOUS INSTITUTION`, `DUPLICATE`, or `ESTATE - HEIRS NOT FOUND` (case/whitespace-insensitive, exact match) are dropped from the population at selection time, before any matching runs. A blank/NULL `corrected_contact_type` is eligible. There is no Contact Group dedup/exclusion step for DEO — every record is judged, kept, and reported on its own, even when it shares a `contact_group_id` with another record.
 - A record with no other match is tagged `N` ("No valid mailing address") if `recorded_address` is blank or a placeholder (`N/A`, `UNKNOWN`) — this checks `recorded_address` alone, not the input/skip-traced address fields.
-- Independently of every rule above — including a record that already matched something — a record is also tagged `N` ("Ownership portion not available") if `ownerhsip_portion` is blank or `UNKNOWN`. (The output renames this column to `ownership_portion`.)
+- `ownerhsip_portion` (output renamed to `ownership_portion`) is carried through to the output for reference only — it is **not** used as an exclusion rule.
 
 **Conversion Campaign / Sales Recycled lists** (Prio 2/3/4, JR/Mid/SR AA Sales Recycled) — these populations ARE Pipedrive deals, so each record is checked against every *other* Pipedrive deal (its own deal is excluded from the comparison) plus the archive:
 - Mailing address, phone number, **and email** (the only population type where email is checked) match another deal's contact info, or appear in **C3** (address, phone, and email are all checked against C3 for this population).
@@ -150,7 +152,7 @@ Each population's own source (the local database table, or the uploaded export f
 `id`, `Category`, `contact_group_id`, `Serial Number`, `Owner`, `First Name`, `Middle Name`, `Last Name`, `County`, `State`, `Input: Address`, `Input: City`, `Input: State`, `Input: Zip Code` (optional), `md_address`, `md_city`, `md_state`, `phone1`–`phone5`
 
 **NCOP** (`ncop` table):
-`ncop_id`, `is_original`, `contact_type`, `deal_id`, `serial_number`, `first_name`, `last_name`, `owner_name`, `combined_county`; three address sets — `address`/`city`/`state`, `address2`/`city2`/`state2`, `add_address1`/`add_address1_city`/`add_address1_state`; phones `cleaned_phone1`–`cleaned_phone4` and `phone_1`–`phone_5`
+`ncop_id`, `is_original`, `relationship_to_mo`, `lead_type`, `contact_type`, `deal_id`, `serial_number`, `first_name`, `last_name`, `owner_name`, `contact_name`, `combined_county`; three address sets — `address`/`city`/`state`, `address2`/`city2`/`state2`, `add_address1`/`add_address1_city`/`add_address1_state`; phones `cleaned_phone1`–`cleaned_phone4` and `phone_1`–`phone_5`
 
 **Pooling Order** (`pooling_order` table):
 `po_id`, `contact_type`, `deal_id`, `serial_number`, `lessor_owner`, `first_name`, `last_name`, `target_county`, `target_state`; two address sets — `address`/`city`/`state` and `add_address1`/`add_address1_city`/`add_address1_state`; phones `ph_phone1`–`ph_phone5`
