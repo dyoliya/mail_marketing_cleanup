@@ -77,7 +77,7 @@ class CleanupApp(ctk.CTk):
         families = {name.lower(): name for name in tkfont.families(self)}
         self.UI_FONT = next((families[name] for name in ('segoe ui', 'inter', 'dejavu sans', 'helvetica') if name in families), 'Helvetica')
         self.LOG_FONT = next((families[name] for name in ('consolas', 'dejavu sans mono', 'courier') if name in families), 'Courier')
-        self.title('Mail Marketing Cleanup v1.1.0')
+        self.title('Mail Marketing Cleanup v1.2.0')
         # Convert screen pixels to CustomTkinter's logical window dimensions.
         scaling = self._get_window_scaling()
         width = min(1240, int((self.winfo_screenwidth() - 70) / scaling))

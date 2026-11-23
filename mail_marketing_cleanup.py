@@ -595,6 +595,11 @@ def wide_match_details(complete_result, subset):
               if report_id(e['cleanup_record_id']) in selected]
     print(f'  [wide_match_details] filtered {len(complete_result.attrs["match_details"]):,} '
           f'raw events to {len(events):,} in {time.perf_counter()-_t0:.1f}s')
+    duplicate_events = {
+        report_id(event['cleanup_record_id']): event
+        for event in events
+        if event['match_type'] == 'DUPLICATE_NCOP_ROW'
+    }
     # record -> match type/source -> normalized key -> actual matching IDs
     matches = {}
     labels = {}
@@ -629,6 +634,18 @@ def wide_match_details(complete_result, subset):
     for _, row in excluded.iterrows():
         rid = report_id(row[id_column])
         output = {id_column: rid}
+
+        if id_column == 'ncop_id':
+            duplicate = duplicate_events.get(rid, {})
+            output['reason_for_removal'] = match_text(
+                row.get('reason_for_removal')
+            )
+            output['duplicate_of_ncop_id'] = report_id(
+                duplicate.get('reference_id')
+            )
+            output['duplicate_match_key'] = duplicate.get(
+                'source_value', ''
+            )
         if not group_column and not campaign:
             output['existing_deal_id'] = report_id(row.get('deal_id'))
         elif group_column:
@@ -659,6 +676,12 @@ def wide_match_details(complete_result, subset):
     print(f'  [wide_match_details] built {len(rows):,} output row dicts in {time.perf_counter()-_t0:.1f}s')
     _t0 = time.perf_counter()
     columns = [id_column] if campaign else [id_column, 'group_matched_member_ids' if group_column else 'existing_deal_id']
+    if id_column == 'ncop_id':
+        columns[1:1] = [
+            'reason_for_removal',
+            'duplicate_of_ncop_id',
+            'duplicate_match_key',
+        ]
     for kind, name in match_types:
         if kind == 'CONTACT_GROUP_ID' and group_column != 'contact_group_id' and not campaign:
             continue
@@ -1560,7 +1583,7 @@ def load_c3(folder, address_normalizer=None):
 
 # C3 acquisition is shared by every population and does not change cleanup rules.
 C3_DRIVE_NAME = re.compile(
-    r'^(\d{2}-\d{2}-\d{4}) (Addresses|Phones|Emails) \(Consolidated\)\.xlsx$',
+    r'^(\d{2}-\d{2}-\d{4}) (Addresses|Phones|Emails) \(Consolidated\)\.(?:xlsx|csv)$',
     re.IGNORECASE,
 )
 C3_XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -1584,26 +1607,60 @@ def c3_drive_folder_id(value):
 
 
 def select_latest_c3_files(items):
-    """Use the date in each filename, independently for each C3 kind."""
+    """Use the filename date to choose each kind across XLSX and CSV files."""
     candidates = {kind: [] for kind in ('Addresses', 'Phones', 'Emails')}
+
     for item in items:
-        match = C3_DRIVE_NAME.fullmatch(item.get('name', ''))
-        if not match or item.get('mimeType') not in (C3_XLSX_MIME, C3_SHEETS_MIME):
+        name = item.get('name', '')
+        match = C3_DRIVE_NAME.fullmatch(name)
+        if not match:
             continue
+
+        mime = item.get('mimeType', '')
+
+        is_xlsx = (
+            name.lower().endswith('.xlsx')
+            and mime in (C3_XLSX_MIME, C3_SHEETS_MIME)
+        )
+
+        # Uploaded CSVs can have different MIME labels in Drive.
+        # Native Google files require export rather than direct download.
+        is_csv = (
+            name.lower().endswith('.csv')
+            and not mime.startswith('application/vnd.google-apps.')
+        )
+
+        if not (is_xlsx or is_csv):
+            continue
+
         try:
             date = datetime.strptime(match.group(1), '%m-%d-%Y')
         except ValueError:
             continue
+
         candidates[match.group(2).title()].append((date, item))
+
     selected = {}
+
     for kind, matches in candidates.items():
         if not matches:
-            raise ValueError(f'Drive folder: no dated {kind} (Consolidated).xlsx file found.')
+            raise ValueError(
+                f'Drive folder: no dated {kind} '
+                '(Consolidated).xlsx or .csv file found.'
+            )
+
         newest = max(date for date, _ in matches)
         latest = [item for date, item in matches if date == newest]
+
         if len(latest) != 1:
-            raise ValueError(f'Drive folder: multiple {kind} files dated {newest:%m-%d-%Y}. Keep one latest copy.')
+            raise ValueError(
+                f'Drive folder: multiple {kind} files dated '
+                f'{newest:%m-%d-%Y}. '
+                'Keep one latest copy, either XLSX or CSV.'
+            )
+
         selected[kind] = latest[0]
+
     return selected
 
 
@@ -2251,8 +2308,9 @@ NCOP_PHONE_COLS = (
     + [f'phone_{i}' for i in range(1, 6)]
 )
 NCOP_COLS = (
-    ['ncop_id', 'is_original', 'contact_type', 'deal_id', 'serial_number',
-     'first_name', 'last_name', 'owner_name', 'combined_county']
+    ['ncop_id', 'is_original', 'relationship_to_mo', 'lead_type',
+     'contact_type', 'deal_id', 'serial_number',
+     'first_name', 'last_name', 'owner_name', 'contact_name', 'combined_county']
     + [column for columns in NCOP_ADDRESS_SETS.values() for column in columns]
     + NCOP_PHONE_COLS
 )
@@ -2293,17 +2351,43 @@ def count_no_address(result):
     return int(result['reason_for_removal'].astype(str).str.contains(NO_ADDRESS_REASON, regex=False).sum())
 
 
+def ncop_owner_flags(frame):
+    flags = frame['is_original'].map(ncop_text).str.upper()
+    relationship = frame['relationship_to_mo'].map(ncop_text).str.upper()
+    lead_type = frame['lead_type'].map(ncop_text).str.upper()
+
+    owner_override = (
+        relationship.isin(['MINERAL OWNER', 'SELF'])
+        | lead_type.str.contains('OWNER', regex=False)
+    )
+
+    return flags.mask(owner_override, 'Y')
+
+
 def ncop_selection_sql(scope):
     if scope not in NCOP_SCOPES:
         raise ValueError('Select Original Owners, Heirs, or Both for NCOP.')
+
     values = NCOP_SCOPES[scope]
     placeholders = ','.join('?' for _ in values)
-    # Retain the old contact-type restrictions; remove the hardcoded ID list.
+
+    owner_flag_sql = """
+        CASE
+            WHEN UPPER(TRIM(COALESCE(is_original, ''))) = 'Y'
+              OR UPPER(TRIM(COALESCE(relationship_to_mo, '')))
+                 IN ('MINERAL OWNER', 'SELF')
+              OR UPPER(COALESCE(lead_type, '')) LIKE '%OWNER%'
+            THEN 'Y'
+            ELSE UPPER(TRIM(COALESCE(is_original, '')))
+        END
+    """
+
     where = (
-        f'UPPER(TRIM(is_original)) IN ({placeholders}) '
+        f'({owner_flag_sql}) IN ({placeholders}) '
         "AND contact_type IS NOT NULL "
         "AND UPPER(TRIM(contact_type)) NOT IN ('COMPANY', 'RELIGIOUS INSTITUTION')"
     )
+
     return where, values
 
 
@@ -2521,6 +2605,87 @@ def cleanup_ncop(df, ready):
     return audit.finish(result)
 
 
+def apply_ncop_deduplication(result):
+    # Run AFTER cleanup_ncop(): only rows that passed cleanup may compete.
+    fields = ['owner_name', 'contact_name', 'address', 'city', 'state']
+    require_columns(
+        result.columns,
+        ['ncop_id', 'clean_tag', *fields],
+        'NCOP results',
+    )
+
+    # Keep large evidence metadata off the frame during pandas operations.
+    metadata = dict(result.attrs)
+    result.attrs = {}
+    events = list(metadata.get('match_details', []))
+
+    ids = pd.to_numeric(result['ncop_id'], errors='raise').astype('Int64')
+    if ids.isna().any() or ids.duplicated().any():
+        raise ValueError(
+            'NCOP deduplication requires unique nonblank ncop_id values.'
+        )
+
+    result['duplicate_of_ncop_id'] = ''
+
+    clean = result.loc[result['clean_tag'].eq('Y'), fields].copy()
+    clean['_numeric_id'] = ids.loc[clean.index]
+
+    for field in fields:
+        clean[field] = clean[field].map(ncop_text)
+
+    clean = clean.sort_values('_numeric_id', kind='stable')
+
+    retained = clean.groupby(
+        fields, sort=False, dropna=False
+    )['_numeric_id'].transform('first')
+
+    duplicates = clean.loc[clean['_numeric_id'].ne(retained)]
+
+    for index, row in duplicates.iterrows():
+        rid = report_id(result.at[index, 'ncop_id'])
+        keeper = report_id(retained.at[index])
+
+        key = json.dumps(
+            {field: row[field] for field in fields},
+            ensure_ascii=False,
+        )
+
+        result.at[index, 'clean_tag'] = 'N'
+        result.at[index, 'duplicate_of_ncop_id'] = keeper
+        result.at[index, 'reason_for_removal'] = (
+            'Duplicate among clean NCOP rows: same owner_name, contact_name, '
+            f'address, city and state as ncop_id {keeper}; '
+            'retained the lowest ncop_id among matching clean rows.'
+        )
+
+        events.append({
+            'population': 'NCOP',
+            'cleanup_record_id': rid,
+            'evidence_record_id': rid,
+            'contact_group_id': '',
+            'match_type': 'DUPLICATE_NCOP_ROW',
+            'source_field': ' | '.join(fields),
+            'source_value': key,
+            'matched_key': key,
+            'reference_source': 'SOURCE_DATABASE',
+            'reference_field': 'ncop_id',
+            'reference_value': keeper,
+            'reference_value_format': 'RAW',
+            'reference_id': keeper,
+        })
+
+    metadata['match_details'] = events
+    metadata['ncop_duplicates_retagged'] = len(duplicates)
+    result.attrs = metadata
+
+    print(
+        f'NCOP deduplication: {len(duplicates):,} clean duplicates '
+        'retagged N; no rows dropped.'
+    )
+
+    return result
+
+
 def execute_ncop(config, ready, result_folder):
     where, values = ncop_selection_sql(config['ncop_scope'])
     with contextlib.closing(open_db(config['db'])) as con:
@@ -2542,11 +2707,12 @@ def execute_ncop(config, ready, result_folder):
     if df['ncop_id'].isna().any():
         raise ValueError('NCOP contains a missing ncop_id.')
     result = cleanup_ncop(df, ready)
+    result = apply_ncop_deduplication(result)
     date = datetime.now(ZoneInfo('America/Chicago')).strftime('%Y%m%d')
     outputs = []
     for flag in NCOP_SCOPES[config['ncop_scope']]:
         label = 'Original Owners' if flag == 'Y' else 'Heirs'
-        subset = result.loc[result['is_original'].map(ncop_text).str.upper().eq(flag)]
+        subset = result.loc[ncop_owner_flags(result).eq(flag)]
         # A selected owner type gets an output file, even when it has zero rows.
         for part, start in enumerate(range(0, max(1, len(subset)), 1048575), 1):
             suffix = f' - part {part}' if len(subset) > 1048575 else ''
@@ -2559,6 +2725,7 @@ def execute_ncop(config, ready, result_folder):
             print(f'Saved {target.name}: {len(subset.iloc[start:start+1048575]):,} rows.')
     summary = {
         'population': 'NCOP', 'owner_selection': config['ncop_scope'],
+        'duplicates_retagged_N': result.attrs.get('ncop_duplicates_retagged', 0),
         'input_rows': loaded, 'output_rows': len(result),
         'clean_Y': int(result['clean_tag'].eq('Y').sum()),
         'excluded_N': int(result['clean_tag'].eq('N').sum()),
@@ -3044,14 +3211,6 @@ def cleanup_deo(df, ready):
         if not reasons[index] and not recorded_present.at[index]:
             reasons[index].append(NO_ADDRESS_REASON)
             audit.add(index, 'NO_MAILING_ADDRESS', 'recorded_address', '', 'SOURCE_DATABASE', '', '')
-
-    # Independent of every other check: unknown ownership portion also forces N.
-    portion = result['ownerhsip_portion'].map(ncop_text).str.upper()
-    missing_portion = portion.eq('') | portion.eq('UNKNOWN')
-    for index in result.index[missing_portion]:
-        reasons[index].append('Ownership portion not available')
-        audit.add(index, 'OWNERSHIP_PORTION_MISSING', 'ownerhsip_portion',
-                  result.at[index, 'ownerhsip_portion'], 'SOURCE_DATABASE', '', '')
 
     result['clean_tag'] = ['N' if reasons[index] else 'Y' for index in result.index]
     result['reason_for_removal'] = [
