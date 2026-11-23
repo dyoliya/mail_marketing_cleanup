@@ -6,7 +6,7 @@ It takes a mailing population (Bottoms Up, NCOP, Pooling Order, NTM, Deceased Ow
 
 ---
 
-![Version](https://img.shields.io/badge/version-1.0.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/version-1.1.0-ffab4c?style=for-the-badge&logo=python&logoColor=white)
 ![Python](https://img.shields.io/badge/python-3.11%2B-273946?style=for-the-badge&logo=python&logoColor=ffab4c)
 ![Status](https://img.shields.io/badge/status-active-273946?style=for-the-badge&logo=github&logoColor=ffab4c)
 
